@@ -21,6 +21,9 @@ class TFLiteService extends GetxService {
       await _loadLabels();
       _isModelLoaded = true;
       print('✅ TFLite model loaded successfully');
+      print('📊 Model input shape: ${_interpreter?.getInputTensors()}');
+      print('📊 Model output shape: ${_interpreter?.getOutputTensors()}');
+      print('📋 Loaded ${_labels.length} labels');
     } catch (e) {
       print('❌ Error loading TFLite model: $e');
       _isModelLoaded = false;
@@ -49,23 +52,40 @@ class TFLiteService extends GetxService {
           .where((label) => label.isNotEmpty)
           .toList();
     } catch (e) {
-      throw Exception('Failed to load labels: $e');
+      throw (e);
     }
   }
 
   /// Run object detection on image
   Future<DetectionResult?> detectObject(img.Image image) async {
     if (!_isModelLoaded || _interpreter == null) {
-      print('Model not loaded');
+      print('❌ Model not loaded');
       return null;
     }
 
     try {
+      print('🔍 Starting detection...');
+
       // Preprocess image
       final input = _preprocessImage(image);
+      print(
+        '✅ Image preprocessed: ${AppConstants.targetImageWidth}x${AppConstants.targetImageHeight}',
+      );
+
+      // Get model input/output details
+      final inputShape = _interpreter!.getInputTensor(0).shape;
+      final outputTensors = _interpreter!.getOutputTensors();
+
+      print('📊 Input shape: $inputShape');
+      print('📊 Output tensors count: ${outputTensors.length}');
 
       // Prepare output buffers for SSD MobileNet
-      // Output format: [locations, classes, scores, numDetections]
+      // The model typically outputs:
+      // 0: detection_boxes [1, num_detections, 4]
+      // 1: detection_classes [1, num_detections]
+      // 2: detection_scores [1, num_detections]
+      // 3: num_detections [1]
+
       var outputLocations = List.filled(1 * 10 * 4, 0.0).reshape([1, 10, 4]);
       var outputClasses = List.filled(1 * 10, 0.0).reshape([1, 10]);
       var outputScores = List.filled(1 * 10, 0.0).reshape([1, 10]);
@@ -79,18 +99,31 @@ class TFLiteService extends GetxService {
       };
 
       // Run inference
+      print('⚡ Running inference...');
       _interpreter!.runForMultipleInputs([input], outputs);
+      print('✅ Inference completed');
 
       // Process results
-      return _processOutput(outputScores, outputClasses);
-    } catch (e) {
-      print('Error during detection: $e');
+      final result = _processOutput(outputScores, outputClasses);
+
+      if (result.isValid) {
+        print(
+          '✅ Detected: ${result.label} (${(result.confidence * 100).toStringAsFixed(1)}%)',
+        );
+      } else {
+        print('⚠️ No valid detection (max confidence below threshold)');
+      }
+
+      return result;
+    } catch (e, stackTrace) {
+      print('❌ Error during detection: $e');
+      print('Stack trace: $stackTrace');
       return null;
     }
   }
 
   /// Preprocess image for model input
-  List<List<List<List<double>>>> _preprocessImage(img.Image image) {
+  List<List<List<List<int>>>> _preprocessImage(img.Image image) {
     // Resize image to model input size
     final resizedImage = img.copyResize(
       image,
@@ -98,14 +131,14 @@ class TFLiteService extends GetxService {
       height: AppConstants.targetImageHeight,
     );
 
-    // Convert to input tensor format
+    // Convert to input tensor format (uint8: 0-255)
     final input = List.generate(
       1,
       (b) => List.generate(
         AppConstants.targetImageHeight,
         (y) => List.generate(AppConstants.targetImageWidth, (x) {
           final pixel = resizedImage.getPixel(x, y);
-          return [pixel.r / 255.0, pixel.g / 255.0, pixel.b / 255.0];
+          return [pixel.r.toInt(), pixel.g.toInt(), pixel.b.toInt()];
         }),
       ),
     );
@@ -121,6 +154,9 @@ class TFLiteService extends GetxService {
     final scores = outputScores[0] as List<double>;
     final classes = outputClasses[0] as List<double>;
 
+    print('📊 Scores: ${scores.take(5).toList()}');
+    print('📊 Classes: ${classes.take(5).toList()}');
+
     // Find the detection with highest confidence
     double maxConfidence = 0.0;
     int maxIndex = 0;
@@ -132,12 +168,18 @@ class TFLiteService extends GetxService {
       }
     }
 
+    print(
+      '🎯 Best detection: index=$maxIndex, score=$maxConfidence, threshold=${AppConstants.minimumConfidence}',
+    );
+
     // Only return if confidence is above minimum threshold
     if (maxConfidence >= AppConstants.minimumConfidence) {
       final classIndex = classes[maxIndex].toInt();
-      final label = classIndex < _labels.length
+      print('🏷️ Class index: $classIndex, Labels count: ${_labels.length}');
+
+      final label = classIndex >= 0 && classIndex < _labels.length
           ? _labels[classIndex]
-          : 'Unknown object';
+          : 'Unknown object #$classIndex';
 
       return DetectionResult(
         label: label,
